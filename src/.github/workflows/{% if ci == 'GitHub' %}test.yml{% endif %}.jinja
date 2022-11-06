@@ -1,0 +1,131 @@
+name: tests
+
+on:
+  pull_request:
+    branches:
+      - "{{ odoo_version }}*"
+  push:
+    branches:
+      - "{{ odoo_version }}"
+      - "{{ odoo_version }}-ocabot-*"
+
+{%
+set IMAGES = {
+  "odoo": {
+    16.0: "ghcr.io/oca/oca-ci/py3.10-odoo16.0:latest",
+    15.0: "ghcr.io/oca/oca-ci/py3.8-odoo15.0:latest",
+    14.0: "ghcr.io/oca/oca-ci/py3.6-odoo14.0:latest",
+    13.0: "ghcr.io/oca/oca-ci/py3.6-odoo13.0:latest",
+    12.0: "ghcr.io/oca/oca-ci/py3.6-odoo12.0:latest",
+    11.0: "ghcr.io/oca/oca-ci/py3.5-odoo11.0:latest",
+    10.0: "ghcr.io/oca/oca-ci/py2.7-odoo10.0:latest",
+  },
+  "ocb": {
+    16.0: "ghcr.io/oca/oca-ci/py3.10-ocb16.0:latest",
+    15.0: "ghcr.io/oca/oca-ci/py3.8-ocb15.0:latest",
+    14.0: "ghcr.io/oca/oca-ci/py3.6-ocb14.0:latest",
+    13.0: "ghcr.io/oca/oca-ci/py3.6-ocb13.0:latest",
+    12.0: "ghcr.io/oca/oca-ci/py3.6-ocb12.0:latest",
+    11.0: "ghcr.io/oca/oca-ci/py3.5-ocb11.0:latest",
+    10.0: "ghcr.io/oca/oca-ci/py2.7-ocb10.0:latest",
+  }
+}
+-%}
+jobs:
+  unreleased-deps:
+    runs-on: ubuntu-latest
+    name: Detect unreleased dependencies
+    steps:
+      - uses: actions/checkout@v2
+      - run: |
+          for reqfile in requirements.txt test-requirements.txt ; do
+              if [ -f ${reqfile} ] ; then
+                  result=0
+                  # reject non-comment lines that contain a / (i.e. URLs, relative paths)
+                  grep "^[^#].*/" ${reqfile} || result=$?
+                  if [ $result -eq 0 ] ; then
+                      echo "Unreleased dependencies found in ${reqfile}."
+                      exit 1
+                  fi
+              fi
+          done
+  test:
+    runs-on: ubuntu-latest
+    container: {% raw %}${{ matrix.container }}{% endraw %}
+    name: {% raw %}${{ matrix.name }}{% endraw %}
+    strategy:
+      fail-fast: false
+      matrix:
+        {%- if rebel_module_groups %}
+        include:
+        {%- for group in rebel_module_groups %}
+          - container: {{ IMAGES["odoo"][odoo_version] }}
+            include: "{{ group }}"
+            makepot: "{{ github_enable_makepot | bool | lower }}"
+            name: test with Odoo
+          - container: {{ IMAGES["ocb"][odoo_version] }}
+            include: "{{ group }}"
+            name: test with OCB
+        {%- endfor %}
+          - container: {{ IMAGES["odoo"][odoo_version] }}
+            exclude: "{{ rebel_module_groups|join(',') }}"
+            makepot: "{{ github_enable_makepot | bool | lower }}"
+            name: test with Odoo
+          - container: {{ IMAGES["ocb"][odoo_version] }}
+            exclude: "{{ rebel_module_groups|join(',') }}"
+            name: test with OCB
+        {%- else %}
+        {#- If all modules can get along, we test and generate .pot all at once #}
+        include:
+          - container: {{ IMAGES["odoo"][odoo_version] }}
+            makepot: "{{ github_enable_makepot | bool | lower }}"
+            name: test with Odoo
+          - container: {{ IMAGES["ocb"][odoo_version] }}
+            name: test with OCB
+        {%- endif %}
+    services:
+      postgres:
+        {%- if odoo_version < 16 %}
+        image: postgres:9.6
+        {%- else %}
+        image: postgres:12.0
+        {%- endif %}
+        env:
+          POSTGRES_USER: odoo
+          POSTGRES_PASSWORD: odoo
+          POSTGRES_DB: odoo
+        ports:
+          - 5432:5432
+    {%- if rebel_module_groups %}
+    env:
+      INCLUDE: "{% raw %}${{ matrix.include }}{% endraw %}"
+      EXCLUDE: "{% raw %}${{ matrix.exclude }}{% endraw %}"
+    {%- endif %}
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          persist-credentials: false
+      - name: Install addons and dependencies
+        run: oca_install_addons
+      - name: Check licenses
+        run: manifestoo -d . check-licenses
+        {%- if not github_check_license %}
+        continue-on-error: true
+        {%- endif %}
+      - name: Check development status
+        run: manifestoo -d . check-dev-status --default-dev-status=Beta
+        {%- if not github_enforce_dev_status_compatibility %}
+        continue-on-error: true
+        {%- endif %}
+      - name: Initialize test db
+        run: oca_init_test_database
+      - name: Run tests
+        run: oca_run_tests
+      {%- if github_enable_codecov %}
+      - uses: codecov/codecov-action@v1
+      {%- endif %}
+      {% raw -%}
+      - name: Update .pot files
+        run: oca_export_and_push_pot https://x-access-token:${{ secrets.GIT_PUSH_TOKEN }}@github.com/${{ github.repository }}
+      {%- endraw %}
+        if: {{ "${{" }} matrix.makepot == 'true' && github.event_name == 'push' && github.repository_owner == '{{ org_slug }}' {{ "}}" }}
